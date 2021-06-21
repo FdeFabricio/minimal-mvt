@@ -6,21 +6,16 @@ import json
 
 # Database to connect to
 DATABASE = {
-    'user':     'pramsey',
-    'password': 'password',
+    'user':     'docker',
+    'password': 'docker',
     'host':     'localhost',
-    'port':     '5432',
-    'database': 'nyc'
+    'port':     '25433',
+    'database': 'danishais'
     }
 
 # Table to query for MVT data, and columns to
 # include in the tiles.
-TABLE = {
-    'table':       'nyc_streets',
-    'srid':        '26918',
-    'geomColumn':  'geom',
-    'attrColumns': 'gid, name, type'
-    }  
+TABLE = {}
 
 # HTTP server information
 HOST = 'localhost'
@@ -106,12 +101,54 @@ class TileRequestHandler(http.server.BaseHTTPRequestHandler):
                        {env}::box2d AS b2d
             ),
             mvtgeom AS (
-                SELECT ST_AsMVTGeom(ST_Transform(t.{geomColumn}, 3857), bounds.b2d) AS geom, 
-                       {attrColumns}
+                SELECT ST_AsMVTGeom(ST_Transform(t.{geomColumn}, 3857), bounds.b2d) AS geom
                 FROM {table} t, bounds
                 WHERE ST_Intersects(t.{geomColumn}, ST_Transform(bounds.geom, {srid}))
             ) 
             SELECT ST_AsMVT(mvtgeom.*) FROM mvtgeom
+        """
+        return sql_tmpl.format(**tbl)
+
+    def envelopeToSQL2(self, env):
+        tbl = TABLE.copy()
+        tbl['env'] = self.envelopeToBoundsSQL(env)
+        # Materialize the bounds
+        # Select the relevant geometry and clip to MVT bounds
+        # Convert to MVT format
+        sql_tmpl = """
+        with
+        bounds AS (
+            SELECT {env} AS geom
+        ), subset_ships AS (
+            SELECT * FROM ships, bounds WHERE intersects(ST_Transform(bounds.geom, SRID(trip)), trip) LIMIT 5
+        ),
+        clipped AS (
+            SELECT mmsi, atGeometry(transform(trip, 3857), bounds.geom)::geometry AS geom
+            FROM subset_ships, bounds
+        ), dump AS (
+            SELECT c.mmsi AS mmsi, (ST_DumpPoints(c.geom)).geom AS geom FROM clipped c
+        ), timestamps as (
+            SELECT array_agg(ST_M(d.geom)) AS TIMESTAMP, d.mmsi AS mmsi
+            FROM DUMP AS d INNER JOIN clipped AS c ON d.mmsi = c.mmsi
+            GROUP BY d.mmsi
+        ), proj_variables as (
+            SELECT st_xmax(b.geom) - st_xmin(b.geom) AS width,
+                   st_ymax(b.geom) - st_ymin(b.geom) AS height,
+                   4096 AS EXTENT,
+                   4096 / (st_xmax(b.geom) - st_xmin(b.geom)) AS fx,
+                   - 4096 / (st_ymax(b.geom) - st_ymin(b.geom)) AS fy,
+                   - st_xmin(b.geom) * (4096 / (st_xmax(b.geom) - st_xmin(b.geom))) AS xoff,
+                   - st_ymax(b.geom) * (- 4096 / (st_ymax(b.geom) - st_ymin(b.geom))) AS yoff
+            FROM bounds AS b
+        ), data AS (
+            SELECT c.mmsi,
+                   ST_SnapToGrid(st_affine(c.geom, v.fx, 0, 0, v.fy, v.xoff, v.yoff), 1) AS geom,
+                   jsonb_build_object('mmsi', c.mmsi, 'timestamps', t.timestamp) AS properties
+            FROM clipped c
+            INNER JOIN timestamps t ON c.mmsi = t.mmsi, proj_variables AS v
+        )
+        SELECT ST_AsMVT(d.*)
+        from data as d
         """
         return sql_tmpl.format(**tbl)
 
@@ -146,7 +183,7 @@ class TileRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         env = self.tileToEnvelope(tile)
-        sql = self.envelopeToSQL(env)
+        sql = self.envelopeToSQL2(env)
         pbf = self.sqlToPbf(sql)
 
         self.log_message("path: %s\ntile: %s\n env: %s" % (self.path, tile, env))
